@@ -1,17 +1,32 @@
 # GTASix7
 
-Baixa vídeos com yt-dlp e gera cortes verticais com a identidade GTASix7.
-Aceita acordos com os criadores, inclusive verbais; não exige planilha ou comprovante.
-Postagem manual.
+Cole o link de um vídeo, informe o @ do criador e receba um MP4 vertical com
+fundo desfocado, marca GTASix7, crédito e cartão final.
+
+**Não precisa de IA, ChatGPT, chave de API ou assinatura.** O processamento roda
+na sua máquina com Python, yt-dlp e FFmpeg. Depois de instalar, basta executar
+um comando no terminal. O script salva o resultado em `prontos/`; você publica
+manualmente.
+
+Use vídeos combinados com os criadores. O fluxo aceita acordos verbais e não
+exige planilha ou comprovante.
 
 ## Instalar
 
-Linux (Fedora/Debian/Ubuntu) ou macOS, com Bash e Python 3.10+:
+Linux (Fedora/Debian/Ubuntu) ou macOS, com Git e Bash. O instalador adiciona
+Python 3, FFmpeg, fonte e yt-dlp; é necessário Python 3.10 ou superior.
+No Windows, execute pelo WSL.
 
 ```bash
+git clone https://github.com/uzoom333/gtasix7.git
+cd gtasix7
 ./instalar.sh
 export PATH="$HOME/.local/bin:$PATH"
 ```
+
+Adicione a linha `export PATH="$HOME/.local/bin:$PATH"` ao arquivo de configuração
+do seu shell (`~/.bashrc` no Bash ou `~/.zshrc` no Zsh) para manter o yt-dlp
+disponível nos próximos terminais.
 
 O instalador usa sudo no Linux e baixa o yt-dlp oficial. FFmpeg precisa dos
 filtros drawtext e concat, encoder AAC e libx264 ou libopenh264. O instalador
@@ -19,6 +34,18 @@ foi executado anteriormente no Fedora; os caminhos apt/Homebrew não foram
 validados nesta máquina. Windows: usar WSL.
 
 ## Um link
+
+Este é o comando mínimo. Substitua o link e o perfil:
+
+```bash
+./baixar.sh 'https://www.instagram.com/reel/ID/' --criador @parceiro
+```
+
+O vídeo é baixado e editado automaticamente. Ao terminar, o terminal mostra
+o caminho do MP4 e da legenda em `prontos/`. Não há tela de chat nem interface
+no navegador: os comandos são executados dentro da pasta do projeto.
+
+Para acrescentar legenda, gancho inicial e um corte:
 
 ```bash
 ./baixar.sh 'https://www.instagram.com/reel/ID/' --criador @parceiro \
