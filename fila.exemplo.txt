@@ -1,0 +1,5 @@
+# Um vídeo por linha; só @criador e URL são obrigatórios.
+# @criador | URL | legenda | gancho | corte
+# " / " quebra linha no gancho. Corte em segundos, por exemplo 3-25.
+# Não use | dentro de legenda/gancho.
+# @parceiro | https://www.instagram.com/reel/ID/ | olha esse final | olha isso / no GTA 6 | 3-25

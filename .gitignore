@@ -1,0 +1,20 @@
+# Conteúdo local, registros e credenciais
+recebidos/
+prontos/
+logs/
+assets/
+autorizacoes/
+autorizados.csv
+fila.txt
+processados.txt
+*.lock
+*.tmp
+*.part
+*.ytdl
+*cookies*
+.env
+.env.*
+__pycache__/
+*.py[cod]
+.venv/
+.DS_Store
