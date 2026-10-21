@@ -2,6 +2,9 @@
 import functools
 import http.server
 import json
+import os
+import shutil
+from types import SimpleNamespace
 from pathlib import Path
 import subprocess
 import tempfile
@@ -18,6 +21,7 @@ class WorkflowTests(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
         self.old_root = app.ROOT
+        self.options = app.EditOptions(subtitles='nenhuma')
         app.ROOT = self.root
         self.addCleanup(setattr, app, 'ROOT', self.old_root)
 
@@ -44,21 +48,85 @@ class WorkflowTests(unittest.TestCase):
 
     def test_audio_cut_special_text_and_invalid_cut(self):
         source = self.sample(audio=True)
-        output = app.edit(source, '@parceiro', 'Legenda: "teste" 100%', "olha: 'isso' 100% / %{n}", '0.5-1.5')
+        output = app.edit(source, '@parceiro', 'Legenda: "teste" 100%', "olha: 'isso' 100% / %{n}", '0.5-1.5', options=self.options)
         self.assert_video(output, 3)
         self.assertIn('Créditos: @parceiro', output.with_suffix('.txt').read_text())
         with self.assertRaises(ValueError):
-            app.edit(source, '@parceiro', cut='1-7')
+            app.edit(source, '@parceiro', cut='1-7', options=self.options)
         self.assertTrue(output.exists())
 
     def test_silent_video(self):
-        output = app.edit(self.sample(), '@parceiro')
+        output = app.edit(self.sample(), '@parceiro', options=self.options)
         self.assert_video(output, 4)
+
+    def test_resolution_and_limits(self):
+        self.assertEqual(app.output_size({'width': 3840, 'height': 2160}, 'auto'), (2160, 3840))
+        self.assertEqual(app.output_size({'width': 2160, 'height': 3840}, 'auto'), (2160, 3840))
+        self.assertEqual(app.output_size({'width': 1920, 'height': 1080}, 'auto'), (1080, 1920))
+        self.assertEqual(app.body_duration(90, 60), 58)
+        self.assertLessEqual(app.body_duration(59.99, 60) + 2, 60)
+        for limit in [0, 2, 61, float('nan')]:
+            with self.assertRaises(ValueError):
+                app.EditOptions(max_duration=limit).validate()
+
+    def test_real_4k_render(self):
+        # 4K de origem, sem forçar upscale de uma amostra pequena.
+        source = self.root / '4k.mp4'
+        app.run(['ffmpeg', '-v', 'error', '-y', '-f', 'lavfi', '-i', 'color=c=blue:s=3840x2160:r=30:d=0.2', '-c:v', 'mpeg4', source])
+        output = app.edit(source, '@teste', options=self.options)
+        info = json.loads(app.run(['ffprobe', '-v', 'error', '-show_streams', '-of', 'json', output], capture_output=True, text=True).stdout)
+        self.assertEqual((info['streams'][0]['width'], info['streams'][0]['height']), (2160, 3840))
+        app.run(['ffmpeg', '-v', 'error', '-xerror', '-i', output, '-f', 'null', '-'])
+
+    def test_real_one_minute_limit(self):
+        source = self.root / 'longo.mp4'
+        app.run(['ffmpeg', '-v', 'error', '-y', '-f', 'lavfi', '-i', 'color=c=blue:s=160x90:r=30:d=65', '-c:v', 'mpeg4', source])
+        output = app.edit(source, '@teste', options=self.options)
+        self.assert_video(output, 60)
+        duration = float(app.run(['ffprobe', '-v', 'error', '-show_entries', 'format=duration', '-of', 'csv=p=0', output], capture_output=True, text=True).stdout)
+        self.assertLessEqual(duration, 60)
+
+    def test_external_srt_audio_cleanup_and_variant(self):
+        source = self.sample(audio=True)
+        srt = self.root / "legenda ' com espaços.srt"
+        srt.write_text('1\n00:00:00,000 --> 00:00:01,500\nTeste de legenda incorporada\n', encoding='utf-8')
+        options = app.EditOptions(subtitle_file=str(srt), audio_mode='limpar')
+        output = app.edit(source, '@teste', options=options)
+        self.assert_video(output, 4)
+        self.assertEqual(output.with_suffix('.srt').read_text(), srt.read_text())
+        old_output = output
+        srt.write_text(srt.read_text().replace('Teste', 'Outro teste'))
+        output = app.edit(source, '@teste', options=options)
+        self.assertNotEqual(old_output, output)
+
+    def test_word_subtitles_clamped_and_sanitized(self):
+        segment = SimpleNamespace(no_speech_prob=0.1, words=[SimpleNamespace(start=0.1, end=0.8, word=' Olá'), SimpleNamespace(start=0.8, end=4, word=' {teste}<b>')])
+        srt = self.root / 'test.srt'
+        self.assertTrue(app.write_subtitles([segment], srt, 2))
+        text = srt.read_text()
+        self.assertIn('00:00:02,000', text)
+        self.assertNotIn('{', text)
+        self.assertNotIn('<', text)
+        self.assertFalse(app.write_subtitles([SimpleNamespace(no_speech_prob=0.9)], self.root / 'silence.srt', 2))
+
+    @unittest.skipUnless(os.environ.get('GTASIX7_TEST_ASR') == '1' and shutil.which('espeak-ng'), 'Teste Whisper opcional: GTASIX7_TEST_ASR=1 e espeak-ng')
+    def test_real_portuguese_transcription_after_cut(self):
+        speech = self.root / 'fala.wav'
+        app.run(['espeak-ng', '-v', 'pt-br', '-s', '140', '-w', speech, 'Este é um teste de legendas automáticas. O vídeo está pronto para publicar.'])
+        source = self.root / 'fala.mp4'
+        app.run(['ffmpeg', '-v', 'error', '-y', '-f', 'lavfi', '-i', 'color=c=0x202030:s=320x180:r=30:d=20', '-i', speech,
+                 '-af', 'adelay=2000:all=1', '-c:v', 'mpeg4', '-c:a', 'aac', '-shortest', source])
+        output = app.edit(source, '@teste', cut='2-8', options=app.EditOptions(language='pt', audio_mode='limpar'))
+        self.assert_video(output, 8)
+        self.assertTrue(output.with_suffix('.srt').is_file())
+        text = output.with_suffix('.srt').read_text().lower()
+        self.assertIn('teste', text)
+        self.assertIn('00:00:0', text)
 
     def args(self):
         # Reutiliza o parser público sem depender do main.
         import argparse
-        return argparse.Namespace(url=None, creator=None, caption='', hook='', cut='', queue=str(self.root / 'fila.txt'), cookies_browser=None)
+        return argparse.Namespace(url=None, creator=None, caption='', hook='', cut='', queue=str(self.root / 'fila.txt'), cookies_browser=None, subtitles='nenhuma')
 
     def test_failures_continue_and_retry_without_recording_failure(self):
         (self.root / 'fila.txt').write_text('@x | https://example.test/falha\n@x | https://example.test/ok\n@x | https://example.test/ok\n')
@@ -76,6 +144,36 @@ class WorkflowTests(unittest.TestCase):
         with patch.object(app, 'run', return_value=subprocess.CompletedProcess([], 0, str(downloaded) + '\n')), patch.object(app, 'edit', side_effect=ValueError('edição falhou')):
             self.assertEqual(app.download(self.args()), 1)
         self.assertEqual((self.root / 'processados.txt').read_text(), 'https://example.test/ok\n')
+
+    def test_ytdlp_quality_caps_8k_and_keeps_vertical_4k(self):
+        fixture = self.root / 'formats.json'
+        fixture.write_text(json.dumps({'id': 'sample', 'title': 'sample', 'extractor': 'generic', 'webpage_url': 'https://example.test/video', 'formats': [
+            {'format_id': name, 'url': f'https://example.test/{name}.mp4', 'ext': 'mp4', 'width': width, 'height': height, 'vcodec': 'h264', 'acodec': 'aac'}
+            for name, width, height in [('1080', 1920, 1080), ('4k', 2160, 3840), ('8k', 7680, 4320)]
+        ]}))
+        (self.root / 'fila.txt').write_text('@x | https://example.test/video\n')
+        downloaded = self.root / 'download.mp4'
+        downloaded.touch()
+        def inspect_real_selector(command, **kwargs):
+            selector = command[command.index('-f') + 1]
+            result = subprocess.run(['yt-dlp', '--ignore-config', '--simulate', '--no-check-formats', '--load-info-json', str(fixture),
+                                     '-f', selector, '--print', 'format_id'], capture_output=True, text=True, check=True)
+            self.assertEqual(result.stdout.strip(), '4k')
+            return subprocess.CompletedProcess(command, 0, str(downloaded) + '\n')
+        with patch.object(app, 'run', side_effect=inspect_real_selector), patch.object(app, 'edit'):
+            self.assertEqual(app.download(self.args()), 0)
+
+    def test_redo_processes_completed_url(self):
+        url = 'https://example.test/video'
+        (self.root / 'fila.txt').write_text(f'@x | {url}\n')
+        (self.root / 'processados.txt').write_text(url + '\n')
+        downloaded = self.root / 'download.mp4'
+        downloaded.touch()
+        args = self.args()
+        args.redo = True
+        with patch.object(app, 'run', return_value=subprocess.CompletedProcess([], 0, str(downloaded) + '\n')), patch.object(app, 'edit') as editor:
+            self.assertEqual(app.download(args), 0)
+            editor.assert_called_once()
 
     def test_validation_empty_queue_and_lock(self):
         for value in ['../perfil', '@', 'nome com espaço']:

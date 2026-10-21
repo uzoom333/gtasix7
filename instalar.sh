@@ -2,10 +2,10 @@
 # Instala FFmpeg, Python 3, fontconfig, Montserrat e yt-dlp.
 set -euo pipefail
 if command -v dnf >/dev/null; then
-  sudo dnf install -y ffmpeg-free python3 fontconfig julietaula-montserrat-fonts curl
+  sudo dnf install -y ffmpeg-free python3 python3-pip fontconfig julietaula-montserrat-fonts curl
 elif command -v apt-get >/dev/null; then
   sudo apt-get update
-  sudo apt-get install -y ffmpeg python3 fontconfig fonts-montserrat curl
+  sudo apt-get install -y ffmpeg python3 python3-venv fontconfig fonts-montserrat curl
 elif command -v brew >/dev/null; then
   brew install ffmpeg python fontconfig
   brew install --cask font-montserrat
@@ -24,3 +24,4 @@ if [[ ! -e "$(dirname "$0")/fila.txt" ]]; then
   cp "$(dirname "$0")/fila.exemplo.txt" "$(dirname "$0")/fila.txt"
 fi
 printf 'Instalação concluída. Inclua %s/.local/bin no PATH.\n' "$HOME"
+"$(dirname "$0")/instalar-legendas.sh"
