@@ -49,10 +49,11 @@ Por padrão, ele:
 
 - Baixa a melhor qualidade disponível até 4K, com o melhor áudio disponível.
 - Gera vídeo vertical 9:16, em 2160×3840 quando a fonte tem 4K, ou 1080×1920 nos demais casos.
-- Limita a saída a **60 segundos no total**: até 58 s do vídeo + 2 s de cartão final.
+- Limita a saída a **60 segundos no total**: no perfil padrão, até 58 s do vídeo + 2 s de cartão final.
 - Normaliza o volume com FFmpeg para alvo de −16 LUFS e pico de −1,5 dBTP.
 - Transcreve a fala localmente e incorpora as legendas na imagem; também salva `.srt`.
-- Preserva marca GTASix7, crédito `via @criador`, fundo desfocado e cartão final.
+- Aplica marca GTASix7, crédito `via @criador` e o enquadramento do perfil escolhido.
+- Preserva a taxa média da fonte até 60 fps; fontes com FPS variável são convertidas para taxa constante.
 
 A fonte precisa oferecer 4K: o script não recupera detalhe ausente. Uma fonte
 com largura ou altura de pelo menos 3840 pixels ativa a saída 4K automática.
@@ -78,8 +79,8 @@ que já estejam desenhados no vídeo.
 | `--resolucao auto` | 4K se a fonte tiver 4K; senão 1080×1920. Sempre vertical |
 | `--resolucao 1080` | Saída 1080×1920, mais leve |
 | `--resolucao 2160` | Saída 2160×3840, inclusive com upscale |
-| `--duracao-max 30` | Limite total entre 3 e 60 s, incluindo o cartão de 2 s |
-| `--audio normalizar` | Ajusta o volume, padrão |
+| `--duracao-max 30` | Limite total entre 3 e 60 s, incluindo o cartão escolhido |
+| `--audio normalizar` | Ajusta o volume, padrão no perfil `padrao` |
 | `--audio limpar` | Redução leve de ruído + ajuste de volume; não separa voz e música |
 | `--audio original` | Mantém o nível original, com conversão para AAC |
 | `--legendas auto` | Transcrição local incorporada ao vídeo, padrão |
@@ -95,7 +96,7 @@ cartão final. Não combine `--srt` com `--legendas nenhuma`.
 
 O corte usa segundos (`3-25` ou `0.5-8.2`), deve caber no vídeo e ter fim maior
 que início. Trechos maiores que o limite são truncados; sem corte, começa em 0.
-Gancho aparece nos primeiros 3 s e aceita ` / ` para quebrar linha. Use texto curto.
+No perfil padrão, o gancho aparece nos primeiros 3 s e aceita ` / ` para quebrar linha. Use texto curto.
 
 Se o Instagram exigir sua sessão do navegador:
 
@@ -105,6 +106,78 @@ Se o Instagram exigir sua sessão do navegador:
 
 Links privados, removidos ou indisponíveis para sua conta podem falhar. O projeto
 usa o programa yt-dlp instalado localmente, sem extensão de navegador.
+
+## Perfis e recortes
+
+Todos os perfis são verticais. Opções explícitas têm prioridade sobre o perfil:
+
+| Perfil | Enquadramento | Legendas | Marca | Áudio | Cartão final |
+|---|---|---|---|---|---|
+| `padrao` | Imagem inteira + fundo desfocado | Discretas | Padrão | Normalizado | 2 s |
+| `gameplay` | Imagem inteira + fundo desfocado | Discretas | Discreta | Nível original | Sem cartão |
+| `comentario` | Preenche a tela, recorte central | Palavra destacada | Discreta | Limpeza + normalização | Sem cartão |
+| `noticia` | Imagem inteira + fundo desfocado | Discretas | Discreta | Normalizado | 1 s |
+
+O gancho dura 3 s em `padrao`/`gameplay` e 2 s em `comentario`/`noticia`.
+
+```bash
+./baixar.sh 'LINK' --criador @parceiro --perfil gameplay
+./baixar.sh 'LINK' --criador @parceiro --perfil comentario --foco direita
+./baixar.sh 'LINK' --criador @parceiro --perfil noticia --outro 0
+```
+
+Novos ajustes, também disponíveis ao editar arquivos locais:
+
+| Opção | Uso |
+|---|---|
+| `--enquadramento ajustar` | Preserva a imagem inteira e preenche as bordas com fundo desfocado |
+| `--enquadramento preencher` | Recorta a imagem para preencher o quadro vertical |
+| `--foco centro` / `esquerda` / `direita` | Escolhe a região horizontal preservada no recorte; só afeta `preencher` |
+| `--estilo-legenda discreta` / `destaque` | Frases curtas ou palavra ativa em amarelo; até duas linhas por bloco |
+| `--gancho-duracao 2` | Duração entre 0 e 10 s; 0 oculta o gancho |
+| `--marca discreta` / `padrao` | Marca menor com transparência ou marca padrão |
+| `--outro 0` | Remove o cartão final; aceita de 0 a 5 s e respeita o limite total |
+| `--fps auto` / `30` / `60` | Preserva a taxa média até 60 fps ou força a taxa escolhida |
+| `--previa` | Exporta todo o trecho escolhido em 360×640, até 30 fps |
+| `--capa-tempo 4.2` | Exporta um JPG do quadro correspondente a 4,2 s do corpo editado |
+
+O foco é fixo: não rastreia pessoas ou personagens. Confira o recorte para não
+esconder a ação ou elementos do jogo. Forçar 60 fps numa fonte de 30 repete quadros;
+não cria movimento adicional. Na exportação automática, 29,97/59,94 fps são mantidos.
+Durações são ajustadas para quadros inteiros e podem variar menos de um quadro.
+
+As legendas têm área reservada acima do crédito e frases divididas em blocos
+curtos. O destaque automático usa os tempos por palavra do Whisper. Com SRT
+externo, o tempo de cada palavra é **estimado**, porque SRT só contém tempos de
+frases. O arquivo `.ass` salvo mostra o estilo efetivamente incorporado ao vídeo.
+
+## Comparar antes de exportar
+
+```bash
+./baixar.sh 'LINK' --criador @parceiro --perfil comentario \
+  --enquadramento preencher --foco esquerda --previa --capa-tempo 1
+```
+
+Prévia e capa ficam em `prontos/previas/`. A prévia não altera `processados.txt`,
+mesmo se a URL já tiver sido concluída, e tem nome diferente do arquivo final.
+Renderiza todo o trecho selecionado, respeitando o limite de 60 s; transcrição
+continua sendo feita quando ativada. Para exportar a versão final, repita o comando
+sem `--previa` (e use `--refazer` se a URL já estiver no histórico).
+
+Para comparar recortes sem baixar de novo, use o arquivo em `recebidos/`:
+
+```bash
+./gtasix7.sh 'recebidos/ARQUIVO.mp4' @parceiro '' 'Veja isso' '3-15' \
+  --perfil comentario --foco esquerda --previa --capa-tempo 2
+./gtasix7.sh 'recebidos/ARQUIVO.mp4' @parceiro '' 'Veja isso' '3-15' \
+  --perfil comentario --foco direita --previa --capa-tempo 2
+```
+
+O tempo da capa é relativo ao início do trecho editado, precisa estar dentro do
+corpo do vídeo e não inclui o cartão final. A imagem usa o quadro nesse instante
+(ou o imediatamente anterior), com a mesma marca, legenda e enquadramento do MP4.
+Os JSONs das saídas registram as opções para facilitar comparação e futura interface;
+ainda não há interface gráfica.
 
 ## Processar uma fila
 
@@ -147,8 +220,10 @@ opções e do conteúdo do SRT, para preservar versões diferentes.
 
 ## Arquivos e testes
 
-MP4 H.264, 30 fps, áudio AAC estéreo a 48 kHz. `prontos/` recebe o vídeo, a legenda
-do post (`.txt`) e, quando há fala ou SRT fornecido, a legenda sincronizada (`.srt`).
+MP4 H.264, até 60 fps, áudio AAC estéreo a 48 kHz. `prontos/` recebe o vídeo, a legenda
+do post (`.txt`) e, quando há fala ou SRT fornecido, as legendas sincronizadas (`.srt` e `.ass`).
+Também salva um `.json` com a origem, o corte, as opções efetivas e as propriedades
+da renderização. Capas pedidas com `--capa-tempo` ficam em `.jpg`.
 Fontes ficam em `recebidos/` e podem manter o contêiner original ou MKV para
 preservar os codecs do download. Erros de download ficam em `logs/`; erros de
 edição aparecem no terminal. Vídeos, cookies, ambiente Python, fila pessoal,
@@ -159,7 +234,8 @@ python3 -m unittest -v test_gtasix7
 ```
 
 A suíte não baixa modelos: usa vídeos sintéticos e cobre HTTP local com yt-dlp,
-renderização 4K, limite de 60 s, áudio, SRT, silêncio, cortes, retomada e duplicatas.
+renderização 4K, limite de 60 s, áudio, legendas, silêncio, recortes laterais,
+60 fps, capas, perfis, prévias, retomada e duplicatas.
 Para testar também a transcrição real com fala sintetizada em português, instale
 `espeak-ng`, prepare o modelo `base` e execute:
 

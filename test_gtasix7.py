@@ -11,6 +11,8 @@ import tempfile
 import threading
 import unittest
 from unittest.mock import patch
+from fractions import Fraction
+from legendas import create_ass
 
 import gtasix7 as app
 
@@ -33,12 +35,12 @@ class WorkflowTests(unittest.TestCase):
         app.run([*command, '-c:v', 'mpeg4', '-q:v', '5', '-c:a', 'aac', path])
         return path
 
-    def assert_video(self, path, expected_duration):
+    def assert_video(self, path, expected_duration, fps="24/1"):
         data = json.loads(app.run(['ffprobe', '-v', 'error', '-show_streams', '-show_format', '-of', 'json', path], capture_output=True, text=True).stdout)
         video = next(s for s in data['streams'] if s['codec_type'] == 'video')
         audio = next(s for s in data['streams'] if s['codec_type'] == 'audio')
         self.assertEqual((video['width'], video['height'], video['pix_fmt']), (1080, 1920, 'yuv420p'))
-        self.assertEqual(video['r_frame_rate'], '30/1')
+        self.assertEqual(video['r_frame_rate'], fps)
         self.assertEqual(audio['channels'], 2)
         self.assertEqual(audio['sample_rate'], '48000')
         self.assertAlmostEqual(float(data['format']['duration']), expected_duration, delta=0.15)
@@ -82,7 +84,7 @@ class WorkflowTests(unittest.TestCase):
         source = self.root / 'longo.mp4'
         app.run(['ffmpeg', '-v', 'error', '-y', '-f', 'lavfi', '-i', 'color=c=blue:s=160x90:r=30:d=65', '-c:v', 'mpeg4', source])
         output = app.edit(source, '@teste', options=self.options)
-        self.assert_video(output, 60)
+        self.assert_video(output, 60, fps="30/1")
         duration = float(app.run(['ffprobe', '-v', 'error', '-show_entries', 'format=duration', '-of', 'csv=p=0', output], capture_output=True, text=True).stdout)
         self.assertLessEqual(duration, 60)
 
@@ -117,7 +119,7 @@ class WorkflowTests(unittest.TestCase):
         app.run(['ffmpeg', '-v', 'error', '-y', '-f', 'lavfi', '-i', 'color=c=0x202030:s=320x180:r=30:d=20', '-i', speech,
                  '-af', 'adelay=2000:all=1', '-c:v', 'mpeg4', '-c:a', 'aac', '-shortest', source])
         output = app.edit(source, '@teste', cut='2-8', options=app.EditOptions(language='pt', audio_mode='limpar'))
-        self.assert_video(output, 8)
+        self.assert_video(output, 8, fps="30/1")
         self.assertTrue(output.with_suffix('.srt').is_file())
         text = output.with_suffix('.srt').read_text().lower()
         self.assertIn('teste', text)
@@ -209,6 +211,74 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(len(outputs), 1)
         self.assert_video(outputs[0], 3)
         self.assertEqual(app.download(self.args()), 0)
+
+
+    def test_profiles_manual_overrides_and_validation(self):
+        gameplay = app.resolve_options(app.EditOptions(profile='gameplay'))
+        self.assertEqual((gameplay.framing, gameplay.audio_mode, gameplay.outro), ('ajustar', 'original', 0))
+        comment = app.resolve_options(app.EditOptions(profile='comentario', framing='ajustar', audio_mode='original', outro=2))
+        self.assertEqual((comment.framing, comment.audio_mode, comment.outro, comment.subtitle_style), ('ajustar', 'original', 2, 'destaque'))
+        self.assertEqual(app.output_fps({'avg_frame_rate': '60000/1001'}, 'auto'), Fraction(60000, 1001))
+        self.assertEqual(app.output_fps({'avg_frame_rate': '120/1'}, 'auto'), 60)
+        self.assertEqual(app.output_fps({'avg_frame_rate': '0/0'}, 'auto'), 30)
+        self.assertLessEqual(app.body_duration(70, 60, 1, float(Fraction(60000, 1001))) + 1, 60)
+        for options in [app.EditOptions(outro=-1), app.EditOptions(outro=6), app.EditOptions(hook_duration=11), app.EditOptions(cover_time=-1)]:
+            with self.assertRaises(ValueError):
+                options.validate()
+
+    def test_focus_preview_pixels_cover_and_no_outro(self):
+        source = self.root / 'faixas.mp4'
+        app.run(['ffmpeg', '-v', 'error', '-y', '-f', 'lavfi', '-i',
+                 'color=c=green:s=960x540:r=60:d=1,drawbox=x=0:y=0:w=320:h=540:c=red:t=fill,drawbox=x=640:y=0:w=320:h=540:c=blue:t=fill',
+                 '-c:v', 'mpeg4', source])
+        for focus, channel in [('esquerda', 0), ('direita', 2)]:
+            output = app.edit(source, '@teste', options=app.EditOptions(profile='comentario', focus=focus, preview=True, subtitles='nenhuma', cover_time=0.5))
+            info = json.loads(app.run(['ffprobe', '-v', 'error', '-show_streams', '-show_format', '-of', 'json', output], capture_output=True, text=True).stdout)
+            self.assertEqual((info['streams'][0]['width'], info['streams'][0]['height'], info['streams'][0]['r_frame_rate']), (360, 640, '30/1'))
+            self.assertAlmostEqual(float(info['format']['duration']), 1, delta=0.05)
+            pixel = app.run(['ffmpeg', '-v', 'error', '-i', output, '-frames:v', '1', '-vf', 'crop=2:2:180:300,format=rgb24', '-f', 'rawvideo', '-'], capture_output=True).stdout
+            self.assertGreater(pixel[channel], 200)
+            self.assertLess(pixel[2 if channel == 0 else 0], 80)
+            self.assertTrue(output.with_suffix('.jpg').is_file())
+            recipe = json.loads(output.with_suffix('.json').read_text())
+            self.assertTrue(recipe['options']['preview'])
+            self.assertEqual(recipe['rendered']['outro_duration'], 0)
+
+    def test_final_60fps_with_highlight_and_cover(self):
+        source = self.root / '60fps.mp4'
+        app.run(['ffmpeg', '-v', 'error', '-y', '-f', 'lavfi', '-i', 'color=c=0x203040:s=320x180:r=60:d=1', '-c:v', 'mpeg4', source])
+        srt = self.root / 'short.srt'
+        srt.write_text('1\n00:00:00,000 --> 00:00:01,000\nEste teste destaca cada palavra.\n')
+        output = app.edit(source, '@teste', hook='Título', options=app.EditOptions(profile='comentario', subtitle_file=str(srt), cover_time=0.999, hook_duration=0.3))
+        self.assert_video(output, 1, fps='60/1')
+        ass = output.with_suffix('.ass').read_text()
+        self.assertIn('\\c&H18C5F5&', ass)
+        self.assertTrue(output.with_suffix('.jpg').is_file())
+        self.assertEqual(json.loads(output.with_suffix('.json').read_text())['subtitle_timing'], 'estimated')
+
+    def test_ass_uses_word_timing_and_at_most_two_lines(self):
+        srt = self.root / 'speech.srt'
+        srt.write_text('1\n00:00:00,000 --> 00:00:01,000\nOlá mundo\n')
+        words = self.root / 'words.json'
+        words.write_text(json.dumps([dict(start=0.1, end=0.3, text='Olá'), dict(start=0.7, end=1, text='mundo')]))
+        target = self.root / 'speech.ass'
+        create_ass(srt, target, 1080, 1920, 1, 'destaque', words)
+        events = [line for line in target.read_text().splitlines() if line.startswith('Dialogue:')]
+        self.assertTrue(any('0:00:00.70,0:00:01.00' in line and '{\\c&H18C5F5&}mundo' in line for line in events))
+        self.assertTrue(all(line.count('\\N') <= 1 for line in events))
+
+    def test_preview_does_not_consume_history(self):
+        url = 'https://example.test/video'
+        (self.root / 'fila.txt').write_text(f'@x | {url}\n')
+        (self.root / 'processados.txt').write_text(url + '\n')
+        downloaded = self.root / 'download.mp4'
+        downloaded.touch()
+        args = self.args()
+        args.preview = True
+        with patch.object(app, 'run', return_value=subprocess.CompletedProcess([], 0, str(downloaded) + '\n')), patch.object(app, 'edit') as editor:
+            self.assertEqual(app.download(args), 0)
+            editor.assert_called_once()
+        self.assertEqual((self.root / 'processados.txt').read_text(), url + '\n')
 
 
 if __name__ == '__main__':

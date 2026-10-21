@@ -15,23 +15,43 @@ import sys
 import tempfile
 import textwrap
 import wave
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
+from fractions import Fraction
 from urllib.parse import urlsplit
+from legendas import create_ass
 
 ROOT = Path(__file__).resolve().parent
+
+PROFILES = {
+    'padrao': dict(framing='ajustar', focus='centro', subtitle_style='discreta', hook_duration=3, brand='padrao', outro=2, fps='auto', audio_mode='normalizar'),
+    'gameplay': dict(framing='ajustar', focus='centro', subtitle_style='discreta', hook_duration=3, brand='discreta', outro=0, fps='auto', audio_mode='original'),
+    'comentario': dict(framing='preencher', focus='centro', subtitle_style='destaque', hook_duration=2, brand='discreta', outro=0, fps='auto', audio_mode='limpar'),
+    'noticia': dict(framing='ajustar', focus='centro', subtitle_style='discreta', hook_duration=2, brand='discreta', outro=1, fps='auto', audio_mode='normalizar'),
+}
 
 
 @dataclass(frozen=True)
 class EditOptions:
     resolution: str = 'auto'
     max_duration: float = 60
-    audio_mode: str = 'normalizar'
+    audio_mode: str | None = None
     subtitles: str = 'auto'
     subtitle_file: str | None = None
     model: str = 'base'
     language: str = 'auto'
+    profile: str = 'padrao'
+    framing: str | None = None
+    focus: str | None = None
+    subtitle_style: str | None = None
+    hook_duration: float | None = None
+    brand: str | None = None
+    outro: float | None = None
+    fps: str | None = None
+    preview: bool = False
+    cover_time: float | None = None
 
     def validate(self):
+        self = resolve_options(self)
         if self.resolution not in {'auto', '1080', '2160'}:
             raise ValueError('Resolução inválida: use auto, 1080 ou 2160.')
         if not math.isfinite(self.max_duration) or not 3 <= self.max_duration <= 60:
@@ -46,6 +66,32 @@ class EditOptions:
             raise ValueError(f'Arquivo SRT não encontrado: {self.subtitle_file}')
         if self.language != 'auto' and not re.fullmatch(r'[a-z]{2,3}', self.language):
             raise ValueError('Idioma inválido: use auto, pt, en ou outro código de idioma.')
+        for field, allowed in [('framing', {'ajustar', 'preencher'}), ('focus', {'centro', 'esquerda', 'direita'}),
+                               ('subtitle_style', {'discreta', 'destaque'}), ('brand', {'discreta', 'padrao'}), ('fps', {'auto', '30', '60'})]:
+            if getattr(self, field) not in allowed:
+                raise ValueError(f'Opção inválida: {field}.')
+        if not math.isfinite(self.outro) or not 0 <= self.outro <= 5 or self.outro >= self.max_duration:
+            raise ValueError('Cartão final deve ter de 0 a 5 segundos e caber na duração máxima.')
+        if not math.isfinite(self.hook_duration) or not 0 <= self.hook_duration <= 10:
+            raise ValueError('Duração do gancho deve ficar entre 0 e 10 segundos.')
+        if self.cover_time is not None and (not math.isfinite(self.cover_time) or self.cover_time < 0):
+            raise ValueError('Tempo da capa deve ser um número positivo ou zero.')
+
+
+def resolve_options(options):
+    if options.profile not in PROFILES:
+        raise ValueError('Perfil inválido: use padrao, gameplay, comentario ou noticia.')
+    return replace(options, **{key: value for key, value in PROFILES[options.profile].items() if getattr(options, key) is None})
+
+
+def output_fps(video, requested, preview=False):
+    try:
+        rate = Fraction(video.get('avg_frame_rate') or video.get('r_frame_rate') or '30') if requested == 'auto' else Fraction(requested)
+        if rate <= 0:
+            rate = Fraction(30)
+    except (ValueError, ZeroDivisionError):
+        rate = Fraction(30)
+    return min(rate, Fraction(30 if preview else 60))
 
 
 def output_size(video, resolution):
@@ -53,9 +99,8 @@ def output_size(video, resolution):
     return width, width * 16 // 9
 
 
-def body_duration(length, limit):
-    # Reserva 2s para o cartão e fecha em quadros inteiros, sem ultrapassar o limite.
-    return max(1, math.floor(min(length, limit - 2) * 30)) / 30
+def body_duration(length, limit, outro=2, fps=30):
+    return max(1, math.floor(min(length, limit - outro) * fps)) / fps
 
 
 def srt_time(seconds):
@@ -66,13 +111,14 @@ def srt_time(seconds):
     return f'{hours:02}:{minutes:02}:{seconds:02},{milliseconds:03}'
 
 
-def write_subtitles(segments, target, duration):
+def write_subtitles(segments, target, duration, word_target=None):
     """Grupos curtos de palavras; os tempos são relativos ao trecho extraído."""
-    cues = []
+    cues, timings = [], []
     for segment in segments:
         if getattr(segment, 'no_speech_prob', 0) > 0.6:
             continue
         words = list(getattr(segment, 'words', None) or [])
+        timings.extend(dict(start=max(0, w.start), end=min(duration, w.end), text=w.word.strip()) for w in words if w.end > 0 and w.start < duration)
         if not words:
             groups = [(segment.start, segment.end, segment.text)]
         else:
@@ -93,6 +139,8 @@ def write_subtitles(segments, target, duration):
                 cues.append(f'{len(cues) + 1}\n{srt_time(start)} --> {srt_time(end)}\n{wrapped}\n')
     if cues:
         target.write_text('\n'.join(cues), encoding='utf-8')
+        if word_target:
+            word_target.write_text(json.dumps(timings, ensure_ascii=False), encoding='utf-8')
     return bool(cues)
 
 
@@ -115,7 +163,7 @@ def transcribe(source, audio_index, start, length, temp, options):
         segments, _ = model.transcribe(samples, language=None if options.language == 'auto' else options.language,
                                        beam_size=3, word_timestamps=True, vad_filter=True, condition_on_previous_text=False)
         target = temp / 'subtitles.srt'
-        result = target if write_subtitles(segments, target, length) else None
+        result = target if write_subtitles(segments, target, length, temp / 'words.json') else None
     except Exception as error:
         raise ValueError(f'Falha na transcrição: {error}. Confira modelo/idioma; a primeira execução precisa de internet para baixar o modelo.') from error
     finally:
@@ -171,7 +219,7 @@ def lock(path):
 
 
 def edit(source, creator, caption='', hook='', cut='', *, options=None):
-    options = options or EditOptions()
+    options = resolve_options(options or EditOptions())
     options.validate()
     require('ffmpeg', 'ffprobe', 'fc-match')
     creator_name(creator)
@@ -182,12 +230,18 @@ def edit(source, creator, caption='', hook='', cut='', *, options=None):
     videos = [s for s in metadata['streams'] if s['codec_type'] == 'video' and not s.get('disposition', {}).get('attached_pic')]
     if not videos:
         raise ValueError('O arquivo não tem uma faixa de vídeo.')
-    duration = float(videos[0].get('duration') or metadata['format'].get('duration', 0))
+    video = videos[0]
+    duration = float(video.get('duration') or metadata['format'].get('duration', 0))
     if not math.isfinite(duration) or duration <= 0:
         raise ValueError('Não foi possível determinar a duração do vídeo.')
     start, length = cut_bounds(cut, duration)
-    length = body_duration(length, options.max_duration)
-    width, height = output_size(videos[0], options.resolution)
+    rate = output_fps(video, options.fps, options.preview)
+    fps, frame_rate = float(rate), str(rate)
+    outro = round(options.outro * fps) / fps
+    length = body_duration(length, options.max_duration, outro, fps)
+    if options.cover_time is not None and options.cover_time >= length:
+        raise ValueError(f'Tempo da capa deve estar dentro do corpo editado ({length:.2f}s), sem o cartão final.')
+    width, height = (360, 640) if options.preview else output_size(video, options.resolution)
     factor = width / 1080
     audio = next((s for s in metadata['streams'] if s['codec_type'] == 'audio'), None)
     font = run(['fc-match', '-f', '%{file}', 'Montserrat:style=ExtraBold'], capture_output=True, text=True).stdout
@@ -195,19 +249,22 @@ def edit(source, creator, caption='', hook='', cut='', *, options=None):
         raise ValueError('Fonte não encontrada. Execute ./instalar.sh.')
     encoders = run(['ffmpeg', '-hide_banner', '-encoders'], capture_output=True, text=True).stdout
     if 'libx264' in encoders:
-        encoding = ['-c:v', 'libx264', '-preset', 'fast', '-crf', '18']
+        encoding = ['-c:v', 'libx264', '-preset', 'fast', '-crf', '25' if options.preview else '18']
     elif 'libopenh264' in encoders:
-        encoding = ['-c:v', 'libopenh264', '-b:v', '32M' if width == 2160 else '8M']
+        bitrate = '1M' if options.preview else ('48M' if width == 2160 and fps > 30 else '32M' if width == 2160 else '12M' if fps > 30 else '8M')
+        encoding = ['-c:v', 'libopenh264', '-b:v', bitrate]
     else:
         raise ValueError('FFmpeg sem encoder H.264: instale libx264 ou libopenh264.')
     output_dir = ROOT / 'prontos'
-    output_dir.mkdir(exist_ok=True)
-    # Criador e variante evitam sobrescrever cortes diferentes do mesmo vídeo.
+    if options.preview:
+        output_dir /= 'previas'
+    output_dir.mkdir(exist_ok=True, parents=True)
     subtitle_hash = hashlib.sha256(Path(options.subtitle_file).expanduser().read_bytes()).hexdigest() if options.subtitle_file else None
     variant = hashlib.sha256(json.dumps([creator, caption, hook, cut, asdict(options), subtitle_hash], ensure_ascii=False).encode()).hexdigest()[:10]
     stem = re.sub(r'[^\w.-]', '_', source.stem)[:100]
-    output = output_dir / f'{stem}_{variant}_gtasix7.mp4'
-    with lock(output_dir / '.edicao.lock'), tempfile.TemporaryDirectory(prefix='gtasix7-') as tmp:
+    output = output_dir / f'{stem}_{variant}_{"previa" if options.preview else "gtasix7"}.mp4'
+    print(f'Renderizando: {width}x{height}, {frame_rate} fps, {length + outro:.2f}s, perfil {options.profile}.', flush=True)
+    with lock(ROOT / 'prontos' / '.edicao.lock'), tempfile.TemporaryDirectory(prefix='gtasix7-') as tmp:
         temp = Path(tmp)
         (temp / 'font.otf').symlink_to(font)
         (temp / 'creator.txt').write_text(f'via {creator}', encoding='utf-8')
@@ -218,20 +275,28 @@ def edit(source, creator, caption='', hook='', cut='', *, options=None):
             shutil.copyfile(Path(options.subtitle_file).expanduser(), subtitles)
         elif options.subtitles == 'auto' and audio:
             subtitles = transcribe(source, audio['index'], start, length, temp, options)
-        # Fonte, posição e contornos escalam junto com a saída 4K.
+        ass = create_ass(subtitles, temp / 'subtitles.ass', width, height, length, options.subtitle_style, temp / 'words.json') if subtitles else None
         draw = f'drawtext=fontfile={temp}/font.otf:expansion=none'
-        graph = (
-            f'[0:{videos[0]["index"]}]setpts=PTS-STARTPTS,fps=30,split=2[bg0][fg0];'
-            f'[bg0]scale={width}:{height}:force_original_aspect_ratio=increase,crop={width}:{height},setsar=1,boxblur=20:2[bg];'
-            f'[fg0]scale={width}:{height}:force_original_aspect_ratio=decrease:force_divisible_by=2,setsar=1[fg];'
-            '[bg][fg]overlay=(W-w)/2:(H-h)/2,'
-            f"{draw}:text='GTASix7':fontsize={64*factor}:fontcolor=white:borderw={4*factor}:bordercolor=black@0.8:x=(w-text_w)/2:y={140*factor},"
+        graph = f'[0:{video["index"]}]setpts=PTS-STARTPTS,fps={frame_rate},'
+        if options.framing == 'ajustar':
+            graph += (
+                'split=2[bg0][fg0];'
+                f'[bg0]scale={width}:{height}:force_original_aspect_ratio=increase,crop={width}:{height},setsar=1,boxblur=20:2[bg];'
+                f'[fg0]scale={width}:{height}:force_original_aspect_ratio=decrease:force_divisible_by=2,setsar=1[fg];'
+                '[bg][fg]overlay=(W-w)/2:(H-h)/2,'
+            )
+        else:
+            focus = {'centro': '(iw-ow)/2', 'esquerda': '0', 'direita': 'iw-ow'}[options.focus]
+            graph += f'scale={width}:{height}:force_original_aspect_ratio=increase,crop={width}:{height}:x={focus}:y=(ih-oh)/2,setsar=1,'
+        brand_size, opacity = (40, '0.65') if options.brand == 'discreta' else (64, '1')
+        graph += (
+            f"{draw}:text='GTASix7':fontsize={brand_size*factor}:fontcolor=white@{opacity}:borderw={3*factor}:bordercolor=black@0.6:x=(w-text_w)/2:y={140*factor},"
             f'{draw}:textfile={temp}/creator.txt:fontsize={36*factor}:fontcolor=white:borderw={3*factor}:bordercolor=black@0.8:x=(w-text_w)/2:y=h-{220*factor}'
         )
-        if hook:
-            graph += f",{draw}:textfile={temp}/hook.txt:fontsize={68*factor}:fontcolor=black:line_spacing={12*factor}:box=1:boxcolor=0xF5C518:boxborderw={24*factor}:x=(w-text_w)/2:y={330*factor}:enable='lt(t,3)'"
-        if subtitles:
-            graph += f",subtitles=filename={subtitles}:fontsdir={temp}:original_size={width}x{height}:force_style='FontName=Montserrat,FontSize=18,Bold=1,Outline=1.5,Shadow=0,Alignment=2,MarginV=52,MarginL=16,MarginR=16'"
+        if hook and options.hook_duration > 0:
+            graph += f",{draw}:textfile={temp}/hook.txt:fontsize={68*factor}:fontcolor=black:line_spacing={12*factor}:box=1:boxcolor=0xF5C518:boxborderw={24*factor}:x=(w-text_w)/2:y={330*factor}:enable='lt(t,{options.hook_duration})'"
+        if ass:
+            graph += f',ass=filename={ass}:fontsdir={temp}'
         graph += f',trim=duration={length},setpts=PTS-STARTPTS,format=yuv420p[body];'
         audio_source = f'[0:{audio["index"]}]' if audio else 'anullsrc=r=48000:cl=stereo,'
         graph += f'{audio_source}aresample=48000,aformat=channel_layouts=stereo,asetpts=PTS-STARTPTS,atrim=duration={length},'
@@ -240,18 +305,24 @@ def edit(source, creator, caption='', hook='', cut='', *, options=None):
         if audio and options.audio_mode != 'original':
             graph += 'loudnorm=I=-16:TP=-1.5:LRA=11,'
         graph += f'aresample=48000,apad,atrim=duration={length}[sound];'
-        graph += (
-            f'color=c=0x111111:s={width}x{height}:d=2:r=30,'
-            f"{draw}:text='GTASix7':fontsize={120*factor}:fontcolor=white:x=(w-text_w)/2:y=(h/2)-{140*factor},"
-            f"{draw}:text='siga pra mais GTA 6':fontsize={52*factor}:fontcolor=0xF5C518:x=(w-text_w)/2:y=(h/2)+{40*factor},format=yuv420p[outro];"
-            'anullsrc=r=48000:cl=stereo,atrim=duration=2[end_sound];'
-            '[body][sound][outro][end_sound]concat=n=2:v=1:a=1[v][a]'
-        )
+        if outro:
+            graph += (
+                f'color=c=0x111111:s={width}x{height}:d={outro}:r={frame_rate},'
+                f"{draw}:text='GTASix7':fontsize={120*factor}:fontcolor=white:x=(w-text_w)/2:y=(h/2)-{140*factor},"
+                f"{draw}:text='siga pra mais GTA 6':fontsize={52*factor}:fontcolor=0xF5C518:x=(w-text_w)/2:y=(h/2)+{40*factor},format=yuv420p[outro];"
+                f'anullsrc=r=48000:cl=stereo,atrim=duration={outro}[end_sound];'
+                '[body][sound][outro][end_sound]concat=n=2:v=1:a=1[v][a]'
+            )
+        else:
+            graph += '[body]null[v];[sound]anull[a]'
         run(['ffmpeg', '-hide_banner', '-loglevel', 'error', '-y', '-threads', '2', '-filter_complex_threads', '2',
              '-ss', str(start), '-t', str(length), '-i', source, '-filter_complex', graph,
              '-map', '[v]', '-map', '[a]', *encoding, '-threads', '2', '-pix_fmt', 'yuv420p',
-             '-r', '30', '-c:a', 'aac', '-b:a', '192k', '-ar', '48000', '-ac', '2', '-t', str(options.max_duration), '-movflags', '+faststart', temp / 'final.mp4'])
-        # Só troca o resultado final depois de uma renderização completa.
+             '-r', frame_rate, '-c:a', 'aac', '-b:a', '192k', '-ar', '48000', '-ac', '2', '-t', str(options.max_duration), '-movflags', '+faststart', temp / 'final.mp4'])
+        if options.cover_time is not None:
+            cover_index = math.floor(options.cover_time * fps)
+            run(['ffmpeg', '-hide_banner', '-loglevel', 'error', '-y', '-i', temp / 'final.mp4',
+                 '-vf', f'select=eq(n\\,{cover_index})', '-frames:v', '1', '-q:v', '2', temp / 'cover.jpg'])
         staging = output.with_suffix('.mp4.tmp')
         try:
             shutil.copyfile(temp / 'final.mp4', staging)
@@ -259,13 +330,21 @@ def edit(source, creator, caption='', hook='', cut='', *, options=None):
         finally:
             staging.unlink(missing_ok=True)
         output.with_suffix('.txt').write_text(f'{caption}\n\n🎥 Créditos: {creator} (repostado com autorização)\n#gta6 #gtavi #gta #gta6trailer #gtasix7\n', encoding='utf-8')
-        if subtitles:
-            shutil.copyfile(subtitles, output.with_suffix('.srt'))
-        else:
-            output.with_suffix('.srt').unlink(missing_ok=True)
-    print(f'Pronto: {output}\nLegenda: {output.with_suffix(".txt")}', flush=True)
+        for suffix, artifact in [('.srt', subtitles), ('.ass', ass), ('.jpg', temp / 'cover.jpg' if options.cover_time is not None else None)]:
+            if artifact:
+                shutil.copyfile(artifact, output.with_suffix(suffix))
+            else:
+                output.with_suffix(suffix).unlink(missing_ok=True)
+        output.with_suffix('.json').write_text(json.dumps(dict(
+            schema_version=1, source=str(source), creator=creator, caption=caption, hook=hook, cut=cut,
+            options=asdict(options), rendered=dict(start=start, body_duration=length, outro_duration=outro, width=width, height=height, fps=frame_rate),
+            video=str(output), cover=str(output.with_suffix('.jpg')) if options.cover_time is not None else None,
+            subtitle_timing='word' if (temp / 'words.json').exists() else 'estimated' if subtitles else None,
+        ), ensure_ascii=False, indent=2), encoding='utf-8')
+    print(f'Pronto: {output}\nLegenda do post: {output.with_suffix(".txt")}', flush=True)
+    if options.preview:
+        print('Prévia: a URL não foi marcada como concluída. Retire --previa para exportar a versão final.', flush=True)
     return output
-
 
 def download(args):
     require('yt-dlp')
@@ -299,7 +378,7 @@ def download(args):
                 validate_url(url)
                 if cut:
                     cut_bounds(cut, float('inf'))
-                if url in done and not getattr(args, 'redo', False):
+                if url in done and not getattr(args, 'redo', False) and not options.preview:
                     print(f'Já feito: {url}', flush=True)
                     continue
                 key = hashlib.sha256(url.encode()).hexdigest()[:16]
@@ -319,9 +398,10 @@ def download(args):
                         raise ValueError(f'O download não retornou um arquivo. Veja {log}')
                     # FFmpeg mantém erros no terminal; yt-dlp registra detalhes em logs/.
                     edit(paths[-1], creator, caption, hook, cut, options=options)
-                with history.open('a') as handle:
-                    handle.write(url + '\n')
-                done.add(url)
+                if not options.preview:
+                    with history.open('a') as handle:
+                        handle.write(url + '\n')
+                    done.add(url)
             except (ValueError, OSError, subprocess.CalledProcessError, json.JSONDecodeError) as error:
                 failed += 1
                 print(f'Falha na linha {number}: {error}', file=sys.stderr, flush=True)
@@ -332,13 +412,23 @@ def download(args):
 
 def options_from_args(args):
     defaults = EditOptions()
-    return EditOptions(**{name: getattr(args, name, value) for name, value in asdict(defaults).items()})
+    return resolve_options(EditOptions(**{name: getattr(args, name, value) for name, value in asdict(defaults).items()}))
 
 
 def add_edit_options(parser):
+    parser.add_argument('--perfil', dest='profile', choices=list(PROFILES), default='padrao', help='conjunto de ajustes; opções explícitas têm prioridade')
+    parser.add_argument('--enquadramento', dest='framing', choices=['ajustar', 'preencher'], help='ajustar: imagem inteira e fundo desfocado; preencher: recorte vertical')
+    parser.add_argument('--foco', dest='focus', choices=['centro', 'esquerda', 'direita'], help='posição horizontal do recorte em preencher')
+    parser.add_argument('--estilo-legenda', dest='subtitle_style', choices=['discreta', 'destaque'], help='destaque usa tempos por palavra do Whisper; SRT usa estimativa')
+    parser.add_argument('--gancho-duracao', dest='hook_duration', type=float, help='0 a 10 segundos; 0 desativa o gancho')
+    parser.add_argument('--marca', dest='brand', choices=['discreta', 'padrao'])
+    parser.add_argument('--outro', type=float, help='0 a 5 segundos; 0 remove o cartão final')
+    parser.add_argument('--fps', choices=['auto', '30', '60'], help='auto preserva a taxa média da fonte até 60 fps')
+    parser.add_argument('--previa', dest='preview', action='store_true', help='360x640, até 30 fps; não altera o histórico de concluídos')
+    parser.add_argument('--capa-tempo', dest='cover_time', type=float, help='exporta JPG; segundos relativos ao início do trecho editado')
     parser.add_argument('--resolucao', dest='resolution', choices=['auto', '1080', '2160'], default='auto', help='auto: 4K vertical se a fonte tiver 4K; senão 1080x1920')
     parser.add_argument('--duracao-max', dest='max_duration', type=float, default=60, help='3 a 60 segundos, incluindo cartão final (padrão: 60)')
-    parser.add_argument('--audio', dest='audio_mode', choices=['original', 'normalizar', 'limpar'], default='normalizar', help='limpar: redução leve de ruído + normalização')
+    parser.add_argument('--audio', dest='audio_mode', choices=['original', 'normalizar', 'limpar'], default=None, help='limpar: redução leve de ruído + normalização')
     parser.add_argument('--legendas', dest='subtitles', choices=['auto', 'nenhuma'], default='auto', help='transcrição local incorporada ao vídeo (padrão: auto)')
     parser.add_argument('--srt', dest='subtitle_file', help='usar SRT existente, com tempos relativos ao início do corte')
     parser.add_argument('--modelo-whisper', dest='model', choices=['tiny', 'base', 'small'], default='base')
